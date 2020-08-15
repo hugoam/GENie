@@ -194,16 +194,20 @@
 				tbl[key] = mergefield("list", tbl[key], value, mergecopiestotail)
 			end
 		else
-			for _, item in ipairs(src) do
+			for key, item in ipairs(src) do
 				if tbl[item] then
 					if mergecopiestotail then
 						removevalue(tbl, item)
 						table.insert(tbl, item)
-						tbl[item] = item
+						if type(k) ~= "number" then
+							tbl[item] = item
+						end
 					end
 				else
 					table.insert(tbl, item)
-					tbl[item] = item
+					if type(k) ~= "number" then
+						tbl[item] = item
+					end
 				end
 			end
 		end

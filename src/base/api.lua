@@ -1185,6 +1185,12 @@ end
 	}
 
 	newapifield {
+		name  = "cxxmodule",
+		kind  = "table",
+		scope = "project",
+	}
+
+	newapifield {
 		name  = "pchheader",
 		kind  = "string",
 		scope = "config",

@@ -160,6 +160,10 @@
 		return path.hasextension(fname, { ".cc", ".cpp", ".cxx", ".c++", ".c", ".m", ".mm" })
 	end
 
+	function path.ismxxfile(fname)
+		return path.hasextension(fname, { ".ixx", ".mxx", ".cppm" })
+	end
+
 	function path.iscxfile(fname)
 		return path.hasextension(fname, ".cx")
 	end
