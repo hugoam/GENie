@@ -374,6 +374,38 @@
 		return result
 	end
 
+	function premake.gcc.getmxxflag()
+        if string.find(premake.gcc.cc, "clang") then
+            return "-x c++-module"
+        else
+            return ""
+        end
+	end
+    
+	function premake.gcc.getmodulesflag()
+        if string.find(premake.gcc.cc, "clang") then
+            return "-fmodules-ts"
+        else
+            return ""
+        end
+	end
+    
+	function premake.gcc.getmodulespathflag(targetdir)
+        if string.find(premake.gcc.cc, "clang") then
+            return "-fprebuilt-module-path=\"" .. targetdir .. "\""
+        else
+            return ""
+        end
+	end
+    
+	function premake.gcc.getmoduleflag(targetdir, cxxmodule)
+        if string.find(premake.gcc.cc, "clang") and cxxmodule then
+            return "-fmodule-file=\"" .. targetdir .. "/" .. cxxmodule .. ".pcm\""
+        else
+            return ""
+        end
+	end
+
 --
 -- Return platform specific project and configuration level
 -- makesettings blocks.

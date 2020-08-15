@@ -29,7 +29,7 @@
 		local objdirs = {}
 		local additionalobjdirs = {}
 		for _, file in ipairs(prj.allfiles) do
-			if path.issourcefile(file) then
+			if path.issourcefile(file) or path.ismxxfile(file) then
 				objdirs[_MAKE.esc(path.getdirectory(path.trimdots(file)))] = 1
 			end
 		end
@@ -85,7 +85,7 @@
 		end
 
 		-- target build rule
-		_p('$(TARGET): $(GCH) $(OBJECTS) $(LIBDEPS) $(EXTERNAL_LIBS) $(RESOURCES) $(OBJRESP) $(LDRESP) | $(TARGETDIR) $(OBJDIRS)')
+		_p('$(TARGET): $(MODULES) $(GCH) $(OBJECTS) $(LIBDEPS) $(EXTERNAL_LIBS) $(RESOURCES) $(OBJRESP) $(LDRESP) | $(TARGETDIR) $(OBJDIRS)')
 
 		if prj.kind == "StaticLib" then
 			if prj.msgarchiving then
@@ -200,6 +200,7 @@
 
 		-- include the dependencies, built by GCC (with the -MMD flag)
 		_p('-include $(OBJECTS:%%.o=%%.d)')
+		_p('-include $(MODULES:%%.pcm=%%.d)')
 		_p('ifneq (,$(PCH))')
 			_p('  -include $(OBJDIR)/$(notdir $(PCH)).d')
 			_p('  -include $(OBJDIR)/$(notdir $(PCH))_objc.d')
@@ -346,13 +347,24 @@
 				-- check if file is excluded.
 				if not is_excluded(prj, cfg, file) then
 					-- if not excluded, add it.
-					_p('\t$(OBJDIR)/%s.o \\'
-						, _MAKE.esc(path.trimdots(path.removeext(file)))
-						)
+					_p('\t$(OBJDIR)/%s.o \\', _MAKE.esc(path.trimdots(path.removeext(file))))
 				end
 			end
 		end
 		_p('')
+
+        if cfg.flags.CppModules then
+            _p('  MODULES := \\')
+            for _, file in ipairs(cfg.files) do
+                if path.ismxxfile(file) then
+                    _p('\t$(TARGETDIR)/%s.pcm \\', _MAKE.esc(path.getbasename(file)))
+                end
+            end
+            _p('')
+        else
+            _p('  MODULES = ')
+            _p('')
+        end
 
 		_p('  define PREBUILDCMDS')
 		if #cfg.prebuildcommands > 0 then
@@ -418,10 +430,18 @@
 		end
 
 		_p('  ALL_CPPFLAGS       += $(CPPFLAGS) %s $(DEFINES) $(INCLUDES)', table.concat(cc.getcppflags(cfg), " "))
-
+        if cfg.flags.CppModules then
+            _p('  MXXFLAGS           = %s', cc.getmxxflag())
+            _p('  CXXMODULESFLAGS    = %s %s', cc.getmodulesflag(), cc.getmodulespathflag(cfg.targetdir))
+        else
+            _p('  MXXFLAGS           = ')
+            _p('  CXXMODULESFLAGS    = ')
+        end
+        
 		_p('  ALL_ASMFLAGS       += $(ASMFLAGS) $(CFLAGS) $(ALL_CPPFLAGS) $(ARCH)%s', make.list(table.join(cc.getcflags(cfg), cfg.buildoptions, cfg.buildoptions_asm)))
 		_p('  ALL_CFLAGS         += $(CFLAGS) $(ALL_CPPFLAGS) $(ARCH)%s', make.list(table.join(cc.getcflags(cfg), cfg.buildoptions, cfg.buildoptions_c)))
-		_p('  ALL_CXXFLAGS       += $(CXXFLAGS) $(CFLAGS) $(ALL_CPPFLAGS) $(ARCH)%s', make.list(table.join(cc.getcflags(cfg), cc.getcxxflags(cfg), cfg.buildoptions, cfg.buildoptions_cpp)))
+		_p('  ALL_MXXFLAGS       += $(CXXFLAGS) $(CFLAGS) $(ALL_CPPFLAGS) $(ARCH) $(CXXMODULESFLAGS) $(MXXFLAGS)%s', make.list(table.join(cc.getcflags(cfg), cc.getcxxflags(cfg), cfg.buildoptions, cfg.buildoptions_cpp)))
+		_p('  ALL_CXXFLAGS       += $(CXXFLAGS) $(CFLAGS) $(ALL_CPPFLAGS) $(ARCH) $(CXXMODULESFLAGS)%s', make.list(table.join(cc.getcflags(cfg), cc.getcxxflags(cfg), cfg.buildoptions, cfg.buildoptions_cpp)))
 		_p('  ALL_OBJCFLAGS      += $(CFLAGS) $(ALL_CPPFLAGS) $(ARCH)%s', make.list(table.join(cc.getcflags(cfg), cc.getobjcflags(cfg), cfg.buildoptions, cfg.buildoptions_objc)))
 		_p('  ALL_OBJCPPFLAGS    += $(CXXFLAGS) $(CFLAGS) $(ALL_CPPFLAGS) $(ARCH)%s', make.list(table.join(cc.getcflags(cfg), cc.getcxxflags(cfg), cc.getobjcflags(cfg), cfg.buildoptions, cfg.buildoptions_objcpp)))
 
@@ -574,15 +594,93 @@
 -- Build command for a single file.
 --
 
-	function cpp.fileRules(prj, cc)
-		local platforms = premake.filterplatforms(prj.solution, cc.platforms, "Native")
+	function cpp.modulefilerule(prj, file)
+		_p('$(TARGETDIR)/%s.pcm: %s $(GCH) $(MAKEFILE) | $(OBJDIR)'
+			, _MAKE.esc(path.getbasename(file))
+			, _MAKE.esc(file)
+			)
+		if prj.msgprecompile then
+			_p('\t@echo ' .. prj.msgprecompile)
+		else
+			_p('\t@echo $(notdir $<)')
+		end
+		_p('\t$(SILENT) $(CXX) $(ALL_MXXFLAGS) $(FORCE_INCLUDE) --precompile -o "$@" -c "$<"')
+		for _, task in ipairs(prj.postcompiletasks or {}) do
+			_p('\t$(SILENT) %s', task)
+			_p('')
+		end
 
-		_p('ifneq (,$(OBJRESP))')
-		_p('$(OBJRESP): $(OBJECTS) | $(TARGETDIR) $(OBJDIRS)')
-		_p('\t$(SILENT) echo $^')
-		_p('\t$(SILENT) echo $^ > $@')
-		_p('endif')
 		_p('')
+	end
+
+    function cpp.filemoduleflag(prj, cc, file)
+        local relfile = path.trimdots(file)
+        for _, entry in ipairs(prj.cxxmodule or {}) do
+			if entry[relfile] then
+                return cc.getmoduleflag('$(TARGETDIR)/', entry[relfile])
+			end
+		end
+        return ''
+    end
+    
+	function cpp.sourcefilerule(prj, cc, file)
+		if (path.isobjcfile(file)) then
+			_p('$(OBJDIR)/%s.o: %s $(GCH_OBJC) $(MAKEFILE) | $(OBJDIR)/%s'
+				, _MAKE.esc(path.trimdots(path.removeext(file)))
+				, _MAKE.esc(file)
+				, _MAKE.esc(path.getdirectory(path.trimdots(file)))
+				)
+		else
+			_p('$(OBJDIR)/%s.o: %s $(GCH) $(MAKEFILE) | $(OBJDIR)/%s'
+				, _MAKE.esc(path.trimdots(path.removeext(file)))
+				, _MAKE.esc(file)
+				, _MAKE.esc(path.getdirectory(path.trimdots(file)))
+				)
+		end
+		if (path.isobjcfile(file) and prj.msgcompile_objc) then
+			_p('\t@echo ' .. prj.msgcompile_objc)
+		elseif prj.msgcompile then
+			_p('\t@echo ' .. prj.msgcompile)
+		else
+			_p('\t@echo $(notdir $<)')
+		end
+		if (path.isobjcfile(file)) then
+			if (path.iscfile(file)) then
+				_p('\t$(SILENT) $(CXX) $(ALL_OBJCFLAGS) $(FORCE_INCLUDE_OBJC) -o "$@" -c "$<"')
+			else
+				_p('\t$(SILENT) $(CXX) $(ALL_OBJCPPFLAGS) $(FORCE_INCLUDE_OBJC) -o "$@" -c "$<"')
+			end
+		elseif (path.isasmfile(file)) then
+			_p('\t$(SILENT) $(CC) $(ALL_ASMFLAGS) -o "$@" -c "$<"')
+		else
+			cpp.buildcommand(path.iscfile(file) and not prj.options.ForceCPP, cpp.filemoduleflag(prj, cc, file), "o")
+		end
+		for _, task in ipairs(prj.postcompiletasks or {}) do
+			_p('\t$(SILENT) %s', task)
+			_p('')
+		end
+		-- _p('ifneq (,$(OBJRESP))')
+		-- _p('$(OBJRESP): $(OBJECTS) | $(TARGETDIR) $(OBJDIRS)')
+		-- _p('\t$(SILENT) echo $^')
+		-- _p('\t$(SILENT) echo $^ > $@')
+		-- _p('endif')
+		-- _p('')
+		_p('')
+	end
+
+	function cpp.rcfilerule(prj, file)
+		_p('$(OBJDIR)/%s.res: %s', _MAKE.esc(path.getbasename(file)), _MAKE.esc(file))
+		if prj.msgresource then
+			_p('\t@echo ' .. prj.msgresource)
+		else
+			_p('\t@echo $(notdir $<)')
+		end
+		_p('\t$(SILENT) $(RESCOMP) $< -O coff -o "$@" $(ALL_RESFLAGS)')
+		_p('')
+	end
+	
+	function cpp.fileRules(prj, cc)
+		table.sort(prj.allfiles)
 
 		_p('ifneq (,$(LDRESP))')
 		_p('$(LDRESP): $(LDDEPS) | $(TARGETDIR) $(OBJDIRS)')
@@ -593,53 +691,16 @@
 
 		table.sort(prj.allfiles)
 		for _, file in ipairs(prj.allfiles or {}) do
-			if path.issourcefile(file) then
-				if (path.isobjcfile(file)) then
-					_p('$(OBJDIR)/%s.o: %s $(GCH_OBJC) $(MAKEFILE) | $(OBJDIR)/%s'
-						, _MAKE.esc(path.trimdots(path.removeext(file)))
-						, _MAKE.esc(file)
-						, _MAKE.esc(path.getdirectory(path.trimdots(file)))
-						)
-				else
-					_p('$(OBJDIR)/%s.o: %s $(GCH) $(MAKEFILE) | $(OBJDIR)/%s'
-						, _MAKE.esc(path.trimdots(path.removeext(file)))
-						, _MAKE.esc(file)
-						, _MAKE.esc(path.getdirectory(path.trimdots(file)))
-						)
-				end
-				if (path.isobjcfile(file) and prj.msgcompile_objc) then
-					_p('\t@echo ' .. prj.msgcompile_objc)
-				elseif prj.msgcompile then
-					_p('\t@echo ' .. prj.msgcompile)
-				else
-					_p('\t@echo $(notdir $<)')
-				end
-				if (path.isobjcfile(file)) then
-					if (path.iscfile(file)) then
-						_p('\t$(SILENT) $(CXX) $(ALL_OBJCFLAGS) $(FORCE_INCLUDE_OBJC) -o "$@" -c "$<"')
-					else
-						_p('\t$(SILENT) $(CXX) $(ALL_OBJCPPFLAGS) $(FORCE_INCLUDE_OBJC) -o "$@" -c "$<"')
-					end
-				elseif (path.isasmfile(file)) then
-					_p('\t$(SILENT) $(CC) $(ALL_ASMFLAGS) -o "$@" -c "$<"')
-				else
-					cpp.buildcommand(path.iscfile(file) and not prj.options.ForceCPP, "o")
-				end
-				for _, task in ipairs(prj.postcompiletasks or {}) do
-					_p('\t$(SILENT) %s', task)
-					_p('')
-				end
+			if path.ismxxfile(file) then
+				cpp.modulefilerule(prj, file)
+			end
+		end
 
-				_p('')
+		for _, file in ipairs(prj.allfiles or {}) do
+			if path.issourcefile(file) then
+				cpp.sourcefilerule(prj, cc, file)
 			elseif (path.getextension(file) == ".rc") then
-				_p('$(OBJDIR)/%s.res: %s', _MAKE.esc(path.getbasename(file)), _MAKE.esc(file))
-				if prj.msgresource then
-					_p('\t@echo ' .. prj.msgresource)
-				else
-					_p('\t@echo $(notdir $<)')
-				end
-				_p('\t$(SILENT) $(RESCOMP) $< -O coff -o "$@" $(ALL_RESFLAGS)')
-				_p('')
+				cpp.rcfilerule(prj, file)
 			end
 		end
 	end
@@ -664,7 +725,7 @@
 	end
 
 
-	function cpp.buildcommand(iscfile, objext)
+	function cpp.buildcommand(iscfile, moduleflag, objext)
 		local flags = iif(iscfile, '$(CC) $(ALL_CFLAGS)', '$(CXX) $(ALL_CXXFLAGS)')
-		_p('\t$(SILENT) %s $(FORCE_INCLUDE) -o "$@" -c "$<"', flags, objext)
+		_p('\t$(SILENT) %s %s $(FORCE_INCLUDE) -o "$@" -c "$<"', flags, moduleflag, objext)
 	end
