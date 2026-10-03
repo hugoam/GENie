@@ -131,12 +131,14 @@ end
 
 		cpp.dependencyRules(prj, cfg)
 
+		cpp.moduleRules(prj, cfg, tool)
+
 		cpp.file_rules(prj, cfg, flags)
 
 		local objfiles = {}
 
 		for _, file in ipairs(cfg.files) do
-			if path.issourcefile(file) then
+			if path.issourcefile(file) or path.iscppmodule(file) then
 				table.insert(objfiles, cpp.objectname(cfg, file))
 			end
 		end
@@ -266,7 +268,226 @@ end
 	end
 
 	function cpp.objectname(cfg, file)
+		-- module interfaces keep their extension, as they often share their basename with a source file
+		if path.iscppmodule(file) then
+			return path.join(cfg.objectsdir, path.trimdots(file) .. ".o")
+		end
 		return path.join(cfg.objectsdir, path.trimdots(path.removeext(file)) .. ".o")
+	end
+
+--
+-- C++20 modules
+--
+-- Module interface units (path.iscppmodule) are compiled once, producing both the object file
+-- and the built module interface (BMI), .pcm for clang and .gcm for gcc. Every unit of a project
+-- can import the modules declared by the project itself and by the sibling projects it links,
+-- transitively: their BMIs are passed explicitly to the compiler, and are implicit dependencies
+-- of the unit so that ninja builds them first. Module interfaces of the same project are ordered
+-- by scanning their import declarations.
+--
+
+	local function isclang(tool)
+		return tool.llvm or string.find(tool.cxx, "clang", 1, true) ~= nil
+	end
+
+	local scancache = {}
+
+	-- reads the module name and the imported modules from a module interface source
+	local function scanmodule(abspath)
+		if scancache[abspath] then
+			return scancache[abspath]
+		end
+
+		local result = { name = nil, imports = {} }
+		local f = io.open(abspath, "r")
+		if f then
+			for line in f:lines() do
+				local name = line:match("^%s*export%s+module%s+([%w_%.:]+)%s*;")
+				if name then
+					result.name = name
+				end
+				local import = line:match("^%s*import%s+([%w_%.:]+)%s*;") or line:match("^%s*export%s+import%s+([%w_%.:]+)%s*;")
+				if import then
+					table.insert(result.imports, import)
+				end
+			end
+			f:close()
+		end
+
+		-- partitions are imported by their partition name only
+		local primary = result.name and result.name:match("^([^:]+)")
+		for i, import in ipairs(result.imports) do
+			if import:sub(1, 1) == ":" and primary then
+				result.imports[i] = primary .. import
+			end
+		end
+
+		result.name = result.name or path.getbasename(abspath)
+		scancache[abspath] = result
+		return result
+	end
+
+	-- module interfaces declared by a project configuration
+	function cpp.moduleinterfaces(cfg, tool)
+		if cfg.cppmodules then
+			return cfg.cppmodules
+		end
+
+		local bmiext = isclang(tool) and ".pcm" or ".gcm"
+		local interfaces = {}
+		for _, file in ipairs(cfg.files) do
+			if path.iscppmodule(file) then
+				local abspath = path.getabsolute(path.join(cfg.project.location, cfg.shortname, file))
+				local scan = scanmodule(abspath)
+				table.insert(interfaces, {
+					file    = file,
+					name    = scan.name,
+					imports = scan.imports,
+					bmi     = path.join(cfg.objectsdir, scan.name:gsub(":", "-") .. bmiext),
+				})
+			end
+		end
+
+		cfg.cppmodules = interfaces
+		return interfaces
+	end
+
+	-- module interfaces importable by a project configuration: its own, and the ones of the
+	-- sibling projects it links, transitively
+	function cpp.moduleimports(cfg, tool)
+		local imports = {}
+		local visited = {}
+
+		local function visit(linkcfg)
+			local inner = linkcfg.__inner or linkcfg
+			if visited[inner] then
+				return
+			end
+			visited[inner] = true
+
+			for _, dep in ipairs(premake.getlinks(inner, "siblings", "object")) do
+				visit(dep)
+			end
+
+			for _, m in ipairs(cpp.moduleinterfaces(ninja.get_proxy("cfg", inner), tool)) do
+				table.insert(imports, m)
+			end
+		end
+
+		visit(cfg)
+		return imports
+	end
+
+	function cpp.modulemapper(cfg)
+		return path.join(cfg.objectsdir, "modules.map")
+	end
+
+	-- gcc maps module names to BMIs with a module mapper file, which lists every importable module
+	local function writemodulemapper(cfg, imports)
+		local mapper = cpp.modulemapper(cfg)
+		local abspath = path.getabsolute(path.join(cfg.project.location, cfg.shortname, mapper))
+		local lines = {}
+		for _, m in ipairs(imports) do
+			table.insert(lines, m.name .. " " .. m.bmi)
+		end
+		local content = table.concat(lines, "\n") .. "\n"
+
+		-- only rewrite it when it changes, as it is not tracked by ninja
+		local f = io.open(abspath, "r")
+		if f then
+			local current = f:read("*a")
+			f:close()
+			if current == content then
+				return
+			end
+		end
+
+		os.mkdir(path.getdirectory(abspath))
+		f = io.open(abspath, "w")
+		if not f then
+			p.error("unable to write module mapper " .. abspath)
+		end
+		f:write(content)
+		f:close()
+	end
+
+	-- prepares the module flags and dependencies of each unit, for file_rules()
+	function cpp.moduleRules(prj, cfg, tool)
+		local imports = cpp.moduleimports(cfg, tool)
+		cfg.module_flags = {}
+		cfg.module_deps = {}
+		cfg.module_outputs = {}
+
+		if #imports == 0 then
+			return
+		end
+
+		-- flags to import the modules, except the one the unit declares
+		local function importflags(exclude)
+			local flags = {}
+			if isclang(tool) then
+				for _, m in ipairs(imports) do
+					if m ~= exclude then
+						table.insert(flags, "-fmodule-file=" .. m.name .. "=" .. m.bmi)
+					end
+				end
+			else
+				table.insert(flags, "-fmodules")
+				table.insert(flags, "-fmodule-mapper=" .. cpp.modulemapper(cfg))
+				-- the module rules gcc adds to the dependency file can't be parsed by ninja
+				table.insert(flags, "-Mno-modules")
+			end
+			return table.concat(flags, " ")
+		end
+
+		if not isclang(tool) then
+			writemodulemapper(cfg, imports)
+		end
+		local flags = importflags(nil)
+
+		local own = {}
+		local external = {}
+		local all = {}
+		for _, m in ipairs(cpp.moduleinterfaces(cfg, tool)) do
+			own[m.name] = m
+		end
+		for _, m in ipairs(imports) do
+			if not own[m.name] then
+				table.insert(external, m.bmi)
+			end
+			table.insert(all, m.bmi)
+		end
+
+		for _, file in ipairs(cfg.files) do
+			if path.iscppmodule(file) then
+				local m = nil
+				for _, interface in ipairs(cpp.moduleinterfaces(cfg, tool)) do
+					if interface.file == file then
+						m = interface
+					end
+				end
+
+				local deps = table.join(external)
+				for _, import in ipairs(m.imports) do
+					if own[import] and own[import] ~= m then
+						table.insert(deps, own[import].bmi)
+					end
+				end
+
+				local objfilename = cpp.objectname(cfg, file)
+				cfg.module_deps[objfilename] = deps
+				cfg.module_outputs[objfilename] = { m.bmi }
+				if isclang(tool) then
+					cfg.module_flags[objfilename] = importflags(m) .. " -x c++-module -fmodule-output=" .. m.bmi
+				else
+					cfg.module_flags[objfilename] = importflags(m) .. " -x c++"
+				end
+			elseif path.iscppfile(file) and not path.isobjcfile(file) and (not path.iscfile(file) or cfg.options.ForceCPP) then
+				local objfilename = cpp.objectname(cfg, file)
+				cfg.module_deps[objfilename] = all
+				cfg.module_flags[objfilename] = flags
+			end
+		end
 	end
 
 	function cpp.pchname(cfg, file)
@@ -292,27 +513,32 @@ end
 				_p(1, "flags    = " .. flags['objcflags'] .. extra_flags .. iif(prj.language == "C", "-x objective-c-header", "-x objective-c++-header"))
 				_p(1, "includes = " .. flags.includes)
 				_p(1, "defines  = " .. flags.defines)
-			elseif path.issourcefile(file) then
+			elseif path.issourcefile(file) or path.iscppmodule(file) then
 				local objfilename = cpp.objectname(cfg, file)
-				local extra_deps = #cfg.extra_deps and '| ' .. table.concat(cfg.extra_deps[objfilename] or {}, ' ') or ''
+				local extra_deps = #cfg.extra_deps and '| ' .. table.concat(table.join(cfg.extra_deps[objfilename] or {}, cfg.module_deps[objfilename] or {}), ' ') or ''
 				local order_deps = #cfg.order_deps and '|| ' .. table.concat(cfg.order_deps[objfilename] or {}, ' ') or ''
 				local extra_flags = #cfg.extra_flags and ' ' .. table.concat(cfg.extra_flags[objfilename] or {}, ' ') or ''
-		
+				local module_flags = cfg.module_flags[objfilename] and ' ' .. cfg.module_flags[objfilename] or ''
+				local outputs = objfilename
+				if cfg.module_outputs[objfilename] then
+					outputs = outputs .. " | " .. table.concat(cfg.module_outputs[objfilename], ' ')
+				end
+
 				local cflags = "cflags"
 				if path.isobjcfile(file) then
-					_p("build " .. objfilename .. ": cxx " .. file .. extra_deps .. order_deps)
+					_p("build " .. outputs .. ": cxx " .. file .. extra_deps .. order_deps)
 					cflags = "objcflags"
 				elseif path.isasmfile(file) then
-					_p("build " .. objfilename .. ": cc " .. file .. extra_deps .. order_deps)
+					_p("build " .. outputs .. ": cc " .. file .. extra_deps .. order_deps)
 					cflags = "asmflags"
 				elseif path.iscfile(file) and not cfg.options.ForceCPP then
-					_p("build " .. objfilename .. ": cc " .. file .. extra_deps .. order_deps)
+					_p("build " .. outputs .. ": cc " .. file .. extra_deps .. order_deps)
 				else
-					_p("build " .. objfilename .. ": cxx " .. file .. extra_deps .. order_deps)
+					_p("build " .. outputs .. ": cxx " .. file .. extra_deps .. order_deps)
 					cflags = "cxxflags"
 				end
-	
-				_p(1, "flags    = " .. flags[cflags] .. extra_flags)
+
+				_p(1, "flags    = " .. flags[cflags] .. extra_flags .. module_flags)
 				_p(1, "includes = " .. flags.includes)
 				_p(1, "defines  = " .. flags.defines)
 			elseif path.isresourcefile(file) then
